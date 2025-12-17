@@ -8,16 +8,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: "17"
 
-      - name: Download Flutter SDK
+      # Flutter install (NO subosito/flutter-action)
+      - name: Install Flutter (stable)
         run: |
           git clone https://github.com/flutter/flutter.git -b stable --depth 1
           echo "$PWD/flutter/bin" >> $GITHUB_PATH
@@ -25,15 +26,43 @@ jobs:
       - name: Flutter doctor
         run: flutter doctor
 
-      - name: Create Flutter app
-        run: flutter create app
+      # If repo is already a Flutter project (pubspec.yaml exists), build it.
+      # Otherwise create a temp Flutter project "app" and (optionally) copy your code from custom_app/
+      - name: Prepare project
+        run: |
+          if [ -f "pubspec.yaml" ]; then
+            echo "✅ Flutter project found at repo root"
+            echo "PROJECT_DIR=." >> $GITHUB_ENV
+          else
+            echo "⚠️ No pubspec.yaml at root. Creating Flutter project in ./app"
+            flutter create app --platforms=android
+            echo "PROJECT_DIR=app" >> $GITHUB_ENV
+
+            # OPTIONAL: if you put your app code in custom_app/, it will copy into generated app/
+            if [ -f "custom_app/pubspec.yaml" ]; then
+              echo "✅ Found custom_app/, copying into ./app"
+              rm -rf app/lib
+              cp -r custom_app/lib app/lib
+              cp custom_app/pubspec.yaml app/pubspec.yaml
+            else
+              echo "⚠️ custom_app not found. Building default app."
+            fi
+          fi
+
+      - name: Pub get
+        run: |
+          cd "$PROJECT_DIR"
+          flutter pub get
 
       - name: Build APK (debug)
-        working-directory: app
-        run: flutter build apk --debug
+        run: |
+          cd "$PROJECT_DIR"
+          flutter build apk --debug
 
-      - name: Upload APK
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: debug-apk
-          path: app/build/app/outputs/flutter-apk/app-debug.apk
+          path: |
+            app/build/app/outputs/flutter-apk/app-debug.apk
+            build/app/outputs/flutter-apk/app-debug.apk
