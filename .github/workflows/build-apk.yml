@@ -1,0 +1,28 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "stable"
+
+      - name: Create Flutter project
+        run: flutter create app
+
+      - name: Replace lib & pubspec
+        run: |
+          rm -rf app/lib
+          mkdir -p app/lib
