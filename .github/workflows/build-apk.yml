@@ -8,49 +8,32 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
-          distribution: "temurin"
-          java-version: "17"
+          distribution: temurin
+          java-version: 17
 
-      # IMPORTANT: pin flutter version (stable channel sometimes breaks)
-      - name: Set up Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: "3.16.9"
-          channel: "stable"
-          cache: true
-
-      - name: Create Flutter project (android only)
-        run: flutter create app --platforms=android
-
-      # If you have your app code inside app_src/, it will copy it.
-      # If app_src is missing, it will still build a demo APK (to prove pipeline works).
-      - name: Copy app source (if present)
+      - name: Download Flutter SDK
         run: |
-          if [ -f "app_src/pubspec.yaml" ]; then
-            echo "✅ Found app_src, copying into app/"
-            rm -rf app/lib
-            cp -r app_src/lib app/lib
-            cp app_src/pubspec.yaml app/pubspec.yaml
-          else
-            echo "⚠️ app_src not found. Building default demo app."
-          fi
+          git clone https://github.com/flutter/flutter.git -b stable --depth 1
+          echo "$PWD/flutter/bin" >> $GITHUB_PATH
 
-      - name: Install dependencies
-        working-directory: app
-        run: flutter pub get
+      - name: Flutter doctor
+        run: flutter doctor
 
-      - name: Build DEBUG APK
+      - name: Create Flutter app
+        run: flutter create app
+
+      - name: Build APK (debug)
         working-directory: app
         run: flutter build apk --debug
 
-      - name: Upload APK artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug-apk
+          name: debug-apk
           path: app/build/app/outputs/flutter-apk/app-debug.apk
