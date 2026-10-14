@@ -1,8 +1,7 @@
-name: Build Syntex Imports Android APK
+name: Build Syntex Imports Release APK
 on:
   push:
-    branches:
-      - syntex-apk
+    branches: [syntex-apk]
   workflow_dispatch:
 
 permissions:
@@ -11,7 +10,7 @@ permissions:
 jobs:
   android-apk:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -22,6 +21,7 @@ jobs:
         with:
           channel: stable
           cache: true
+
       - name: Create native Flutter Android project
         run: |
           flutter create --org com.syntex --project-name imports --platforms android /tmp/syntex_android
@@ -30,21 +30,29 @@ jobs:
           sed -i 's/android:label="imports"/android:label="Syntex Imports"/' /tmp/syntex_android/android/app/src/main/AndroidManifest.xml
           cd /tmp/syntex_android
           flutter pub add intl shared_preferences
-      - name: Analyze Flutter source
-        continue-on-error: true
+
+      - name: Build signed release APK
         run: |
           cd /tmp/syntex_android
-          flutter analyze
-      - name: Build installable debug APK
+          flutter build apk --release
+          test -s build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Verify APK signature, manifest and application data
         run: |
-          cd /tmp/syntex_android
-          flutter build apk --debug
-          test -s build/app/outputs/flutter-apk/app-debug.apk
-          sha256sum build/app/outputs/flutter-apk/app-debug.apk
-      - name: Publish installable APK
+          set -euo pipefail
+          APK=/tmp/syntex_android/build/app/outputs/flutter-apk/app-release.apk
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -1)"
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$APK"
+          "$BUILD_TOOLS/aapt" dump badging "$APK" | head -25
+          unzip -t "$APK" | tail -2
+          unzip -l "$APK" | grep 'assets/flutter_assets'
+          ls -lh "$APK"
+          sha256sum "$APK"
+
+      - name: Upload verified APK
         uses: actions/upload-artifact@v4
         with:
-          name: SyntexImports-Android-APK
-          path: /tmp/syntex_android/build/app/outputs/flutter-apk/app-debug.apk
+          name: SyntexImports-Verified-Release-APK
+          path: /tmp/syntex_android/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
           retention-days: 90
