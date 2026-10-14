@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -13,7 +14,7 @@ class ImportProfitApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Import Profit Tracker',
+      title: 'Syntex Imports',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF6B5B95)),
@@ -69,6 +70,7 @@ class Shipment {
   // Costs
   double rmbToPkrRate; // 1 RMB = ? PKR
   double shippingCostPkr;
+  double inventoryCostPkr; // Manual shipment purchase total, separate from freight
   double landingCostPkr; // customs/landing misc in PKR
 
   String warrantiesNote;
@@ -87,6 +89,7 @@ class Shipment {
     required this.landingDate,
     required this.rmbToPkrRate,
     required this.shippingCostPkr,
+    this.inventoryCostPkr = 0,
     required this.landingCostPkr,
     required this.warrantiesNote,
     required this.status,
@@ -96,7 +99,7 @@ class Shipment {
   });
 
   double get totalBuyRmb => items.fold(0.0, (s, x) => s + x.totalBuyRmb);
-  double get totalBuyPkr => totalBuyRmb * rmbToPkrRate;
+  double get totalBuyPkr => inventoryCostPkr > 0 ? inventoryCostPkr : totalBuyRmb * rmbToPkrRate;
   double get totalCostPkr => totalBuyPkr + shippingCostPkr + landingCostPkr;
 
   double get totalSellPkr => items.fold(0.0, (s, x) => s + x.totalSellPkr);
@@ -115,6 +118,7 @@ class Shipment {
         'landingDate': landingDate?.toIso8601String(),
         'rmbToPkrRate': rmbToPkrRate,
         'shippingCostPkr': shippingCostPkr,
+        'inventoryCostPkr': inventoryCostPkr,
         'landingCostPkr': landingCostPkr,
         'warrantiesNote': warrantiesNote,
         'status': status.name,
@@ -131,6 +135,7 @@ class Shipment {
             : DateTime.tryParse(j['landingDate']),
         rmbToPkrRate: (j['rmbToPkrRate'] ?? 0).toDouble(),
         shippingCostPkr: (j['shippingCostPkr'] ?? 0).toDouble(),
+        inventoryCostPkr: (j['inventoryCostPkr'] ?? 0).toDouble(),
         landingCostPkr: (j['landingCostPkr'] ?? 0).toDouble(),
         warrantiesNote: (j['warrantiesNote'] ?? '').toString(),
         status: _statusFromName((j['status'] ?? 'draft').toString()),
@@ -196,6 +201,26 @@ class Storage {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_key, jsonEncode(data.toJson()));
   }
+
+  static Future<String?> cloudBase() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString('syntex_drive_base');
+  }
+  static Future<void> setCloudBase(String text) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('syntex_drive_base', text);
+  }
+}
+
+// Google Drive Document provider: user chooses a Drive file with Android's file picker.
+// No OAuth client ID or extra Google account password is required.
+class DriveDocument {
+  static const MethodChannel _ch = MethodChannel('syntex.drive');
+  static Future<bool> linked() async => await _ch.invokeMethod<bool>('connected') ?? false;
+  static Future<String> create() async => await _ch.invokeMethod<String>('create') ?? '';
+  static Future<String> open() async => await _ch.invokeMethod<String>('open') ?? '';
+  static Future<String> read() async => await _ch.invokeMethod<String>('read') ?? '';
+  static Future<void> write(String json) async => _ch.invokeMethod<void>('write', json);
 }
 
 /// ----------------------
@@ -258,7 +283,121 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _persist() async {
     await Storage.save(data);
+    await _autoCloudSave();
     if (mounted) setState(() {});
+  }
+
+  void _notice(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  // Safe automatic write: do not overwrite a Drive file modified by another phone.
+  Future<void> _autoCloudSave() async {
+    try {
+      if (!await DriveDocument.linked()) return;
+      final local = jsonEncode(data.toJson());
+      final remote = await DriveDocument.read();
+      final base = await Storage.cloudBase();
+      if (remote == local) { await Storage.setCloudBase(local); return; }
+      if ((base != null && remote == base) || (base == null && remote.isEmpty)) {
+        await DriveDocument.write(local);
+        await Storage.setCloudBase(local);
+      } else {
+        _notice('Drive changed elsewhere. Tap Cloud > Sync now to resolve conflict.');
+      }
+    } catch (e) {
+      _notice('Saved on phone. Drive upload failed; use Cloud > Sync now.');
+    }
+  }
+
+  Future<void> _createCloudFile() async {
+    try {
+      await DriveDocument.create();
+      final local = jsonEncode(data.toJson());
+      await DriveDocument.write(local);
+      await Storage.setCloudBase(local);
+      _notice('Drive file created and phone data uploaded. Select Google Drive in the file picker.');
+    } catch (e) {
+      _notice('Drive file was not connected: ' + e.toString());
+    }
+  }
+
+  Future<void> _openCloudFile() async {
+    try {
+      final remote = await DriveDocument.open();
+      if (remote.isEmpty) {
+        final local = jsonEncode(data.toJson());
+        await DriveDocument.write(local);
+        await Storage.setCloudBase(local);
+        _notice('Empty Drive file linked and uploaded');
+        return;
+      }
+      // Never silently replace shipment and investor records.
+      await _chooseConflict(remote);
+    } catch (e) {
+      _notice('Drive file not opened: ' + e.toString());
+    }
+  }
+
+  Future<void> _syncCloud() async {
+    try {
+      if (!await DriveDocument.linked()) {
+        _notice('Choose Cloud > Create Drive file or Open existing Drive file');
+        return;
+      }
+      final remote = await DriveDocument.read();
+      final local = jsonEncode(data.toJson());
+      if (remote == local) { await Storage.setCloudBase(local); _notice('Drive up to date'); return; }
+      final base = await Storage.cloudBase();
+      if (remote.isEmpty || (base != null && remote == base)) {
+        await DriveDocument.write(local);
+        await Storage.setCloudBase(local);
+        _notice('Phone data uploaded to Google Drive');
+      } else if (base != null && local == base) {
+        await _applyCloud(remote);
+      } else {
+        await _chooseConflict(remote);
+      }
+    } catch (e) { _notice('Sync failed: ' + e.toString()); }
+  }
+
+  Future<void> _applyCloud(String remote) async {
+    final decoded = jsonDecode(remote);
+    if (decoded is! Map<String, dynamic> || decoded['shipments'] is! List
+        || decoded['initialCapitalPkr'] == null) {
+      throw const FormatException('Not a Syntex Imports backup file');
+    }
+    final updated = AppData.fromJson(decoded);
+    await Storage.save(updated);
+    await Storage.setCloudBase(remote);
+    if (mounted) setState(() => data = updated);
+    _notice('Downloaded Google Drive records');
+  }
+
+  Future<void> _chooseConflict(String remote) async {
+    final chosen = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Choose data to keep'),
+        content: const Text('This Drive file and the phone have different data. No merge is possible. Choose which FULL copy to keep. Export a separate backup first if needed.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(ctx, 'drive'), child: const Text('Use Drive copy')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, 'phone'), child: const Text('Use phone copy')),
+        ],
+      ),
+    );
+    if (chosen == 'drive') {
+      try { await _applyCloud(remote); } catch (e) { _notice('Drive restore failed: ' + e.toString()); }
+    } else if (chosen == 'phone') {
+      try {
+        final local = jsonEncode(data.toJson());
+        await DriveDocument.write(local);
+        await Storage.setCloudBase(local);
+        _notice('Phone data uploaded to Drive');
+      } catch (e) { _notice('Drive upload failed: ' + e.toString()); }
+    }
   }
 
   Future<void> _editCapitalDialog() async {
@@ -366,7 +505,7 @@ class _HomeScreenState extends State<HomeScreen> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Delete shipment?'),
-        content: const Text('This will remove it from your record.'),
+        content: const Text('Permanently delete this shipment? Any balance entries applied for it will be reversed using its current costs and sales. This cannot be undone.'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
           FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Delete')),
@@ -375,7 +514,11 @@ class _HomeScreenState extends State<HomeScreen> {
     );
 
     if (ok == true) {
-      setState(() => data.shipments.removeWhere((x) => x.id == s.id));
+      setState(() {
+        if (s.costDeductedFromBalance) data.currentBalancePkr += s.totalCostPkr;
+        if (s.saleAddedToBalance) data.currentBalancePkr -= s.totalSellPkr;
+        data.shipments.removeWhere((x) => x.id == s.id);
+      });
       await _persist();
     }
   }
@@ -386,8 +529,22 @@ class _HomeScreenState extends State<HomeScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Import Profit Tracker'),
+        title: const Text('Syntex Imports'),
         actions: [
+          PopupMenuButton<String>(
+            tooltip: 'Google Drive',
+            icon: const Icon(Icons.cloud_sync_outlined),
+            onSelected: (value) {
+              if (value == 'create') _createCloudFile();
+              if (value == 'open') _openCloudFile();
+              if (value == 'sync') _syncCloud();
+            },
+            itemBuilder: (ctx) => const [
+              PopupMenuItem(value: 'create', child: Text('Create Google Drive backup')),
+              PopupMenuItem(value: 'open', child: Text('Open existing Drive backup')),
+              PopupMenuItem(value: 'sync', child: Text('Sync now')),
+            ],
+          ),
           IconButton(
             onPressed: _editCapitalDialog,
             icon: const Icon(Icons.account_balance_wallet_outlined),
@@ -628,7 +785,7 @@ class _ShipmentDetailScreenState extends State<ShipmentDetailScreen> {
             const Text('Totals', style: TextStyle(fontWeight: FontWeight.w800)),
             const SizedBox(height: 10),
             _row('Buying (RMB)', s.totalBuyRmb.toStringAsFixed(2)),
-            _row('Buying (PKR)', 'PKR ${_money.format(s.totalBuyPkr)}'),
+            _row('Inventory buying (PKR)', 'PKR ${_money.format(s.totalBuyPkr)}'),
             _row('Shipping (PKR)', 'PKR ${_money.format(s.shippingCostPkr)}'),
             _row('Landing (PKR)', 'PKR ${_money.format(s.landingCostPkr)}'),
             const Divider(),
@@ -779,6 +936,7 @@ class _ShipmentEditorScreenState extends State<ShipmentEditorScreen> {
   final _title = TextEditingController();
   final _rate = TextEditingController();
   final _shipping = TextEditingController();
+  final _inventory = TextEditingController();
   final _landing = TextEditingController();
   final _warranty = TextEditingController();
 
@@ -798,6 +956,7 @@ class _ShipmentEditorScreenState extends State<ShipmentEditorScreen> {
       _title.text = e.title;
       _rate.text = e.rmbToPkrRate.toString();
       _shipping.text = e.shippingCostPkr.toString();
+      _inventory.text = e.inventoryCostPkr > 0 ? e.inventoryCostPkr.toStringAsFixed(2) : '';
       _landing.text = e.landingCostPkr.toString();
       _warranty.text = e.warrantiesNote;
       landingDate = e.landingDate;
@@ -807,6 +966,7 @@ class _ShipmentEditorScreenState extends State<ShipmentEditorScreen> {
       _title.text = 'Shipment ${DateTime.now().millisecondsSinceEpoch % 10000}';
       _rate.text = '40.0';
       _shipping.text = '0';
+      _inventory.text = '';
       _landing.text = '0';
     }
   }
@@ -816,6 +976,7 @@ class _ShipmentEditorScreenState extends State<ShipmentEditorScreen> {
 
     final r = double.tryParse(_rate.text.trim()) ?? 0;
     final ship = double.tryParse(_shipping.text.trim()) ?? 0;
+    final inventory = double.tryParse(_inventory.text.trim()) ?? 0;
     final land = double.tryParse(_landing.text.trim()) ?? 0;
 
     final existing = widget.existing;
@@ -826,6 +987,7 @@ class _ShipmentEditorScreenState extends State<ShipmentEditorScreen> {
       landingDate: landingDate,
       rmbToPkrRate: r,
       shippingCostPkr: ship,
+      inventoryCostPkr: inventory,
       landingCostPkr: land,
       warrantiesNote: _warranty.text.trim(),
       status: status,
@@ -838,9 +1000,10 @@ class _ShipmentEditorScreenState extends State<ShipmentEditorScreen> {
   double get _totalBuyRmb => items.fold(0.0, (s, x) => s + x.totalBuyRmb);
   double get _rateVal => double.tryParse(_rate.text.trim()) ?? 0;
   double get _shippingVal => double.tryParse(_shipping.text.trim()) ?? 0;
+  double get _inventoryVal => double.tryParse(_inventory.text.trim()) ?? 0;
   double get _landingVal => double.tryParse(_landing.text.trim()) ?? 0;
 
-  double get _totalCostPkr => (_totalBuyRmb * _rateVal) + _shippingVal + _landingVal;
+  double get _totalCostPkr => (_inventoryVal > 0 ? _inventoryVal : _totalBuyRmb * _rateVal) + _shippingVal + _landingVal;
   double get _totalSellPkr => items.fold(0.0, (s, x) => s + x.totalSellPkr);
   double get _profit => _totalSellPkr - _totalCostPkr;
   double get _profitPct => _totalCostPkr <= 0 ? 0 : (_profit / _totalCostPkr) * 100.0;
@@ -993,6 +1156,13 @@ class _ShipmentEditorScreenState extends State<ShipmentEditorScreen> {
                   ),
                   const SizedBox(height: 10),
                   TextField(
+                    controller: _inventory,
+                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                    decoration: const InputDecoration(labelText: 'Inventory buying cost (PKR)', helperText: 'Total cost of goods. Items are its breakdown, not extra charges.'),
+                    onChanged: (_) => setState(() {}),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
                     controller: _shipping,
                     keyboardType: TextInputType.number,
                     decoration: const InputDecoration(labelText: 'Shipping cost (PKR)'),
@@ -1060,6 +1230,8 @@ class _ShipmentEditorScreenState extends State<ShipmentEditorScreen> {
                   const Text('Auto Profit (preview)', style: TextStyle(fontWeight: FontWeight.w800)),
                   const SizedBox(height: 10),
                   _kv('Total Buy (RMB)', _totalBuyRmb.toStringAsFixed(2)),
+                  _kv('Inventory cost (PKR)', 'PKR ${_money.format(_inventoryVal > 0 ? _inventoryVal : _totalBuyRmb * _rateVal)}'),
+                  _kv('Shipping (PKR)', 'PKR ${_money.format(_shippingVal)}'),
                   _kv('Final Cost (PKR)', 'PKR ${_money.format(_totalCostPkr)}'),
                   _kv('Total Selling (PKR)', 'PKR ${_money.format(_totalSellPkr)}'),
                   const Divider(),
