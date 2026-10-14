@@ -1,11 +1,11 @@
-name: Build Syntex Imports Release APK
+name: Build Syntex Imports Android 15 Compatible APK
 on:
   push:
     branches: [syntex-apk]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   android-apk:
@@ -21,8 +21,7 @@ jobs:
         with:
           channel: stable
           cache: true
-
-      - name: Create native Flutter Android project
+      - name: Prepare native Flutter Android app
         run: |
           flutter create --org com.syntex --project-name imports --platforms android /tmp/syntex_android
           cp app/lib/main.dart /tmp/syntex_android/lib/main.dart
@@ -30,29 +29,40 @@ jobs:
           sed -i 's/android:label="imports"/android:label="Syntex Imports"/' /tmp/syntex_android/android/app/src/main/AndroidManifest.xml
           cd /tmp/syntex_android
           flutter pub add intl shared_preferences
-
-      - name: Build signed release APK
+          sed -i 's/targetSdk = flutter.targetSdkVersion/targetSdk = 35/' android/app/build.gradle.kts
+          sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 24/' android/app/build.gradle.kts
+          grep -E 'targetSdk|minSdk|applicationId' android/app/build.gradle.kts
+      - name: Build ARM64 release for Samsung Android 15
         run: |
           cd /tmp/syntex_android
-          flutter build apk --release
-          test -s build/app/outputs/flutter-apk/app-release.apk
-
-      - name: Verify APK signature, manifest and application data
+          flutter build apk --release --target-platform android-arm64
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          test -s "$APK"
+          cp "$APK" "$RUNNER_TEMP/SyntexImports_Android15_ARM64.apk"
+      - name: Verify APK structure and certificate
         run: |
           set -euo pipefail
-          APK=/tmp/syntex_android/build/app/outputs/flutter-apk/app-release.apk
-          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -1)"
-          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$APK"
-          "$BUILD_TOOLS/aapt" dump badging "$APK" | head -25
-          unzip -t "$APK" | tail -2
-          unzip -l "$APK" | grep 'assets/flutter_assets'
-          ls -lh "$APK"
+          APK="$RUNNER_TEMP/SyntexImports_Android15_ARM64.apk"
+          TOOLS="$(find "$ANDROID_HOME/build-tools" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -1)"
+          "$TOOLS/apksigner" verify --verbose --print-certs "$APK"
+          "$TOOLS/aapt" dump badging "$APK" | head -16
+          "$TOOLS/zipalign" -c -v 4 "$APK" | tail -2
+          unzip -t "$APK" | tail -1
+          unzip -l "$APK" | grep -E 'lib/arm64-v8a/libflutter.so|lib/arm64-v8a/libapp.so'
           sha256sum "$APK"
-
-      - name: Upload verified APK
+          ls -lh "$APK"
+      - name: Upload tested build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SyntexImports-Verified-Release-APK
-          path: /tmp/syntex_android/build/app/outputs/flutter-apk/app-release.apk
-          if-no-files-found: error
+          name: SyntexImports_Android15_ARM64
+          path: ${{ runner.temp }}/SyntexImports_Android15_ARM64.apk
           retention-days: 90
+          if-no-files-found: error
+      - name: Publish direct APK link through GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create syntex-android15-v0.4 "$RUNNER_TEMP/SyntexImports_Android15_ARM64.apk" \
+            --title "Syntex Imports Android 15 v0.4" \
+            --notes "ARM64 Android APK with shipment deletion, separate inventory and shipping costs, Google Drive document backup and conflict warnings. Test build; export backups before upgrading." \
+            --target "$GITHUB_SHA"
